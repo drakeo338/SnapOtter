@@ -14,6 +14,7 @@ import { validateImageBuffer } from "../../lib/file-validation.js";
 import { decodeToSharpCompat, needsCliDecode } from "../../lib/format-decoders.js";
 import { decodeHeic } from "../../lib/heic-converter.js";
 import { asInputErrorIfUndecodable, withImageEncodeContext } from "../../lib/image-error.js";
+import { logger } from "../../lib/logger.js";
 import { resolveOutputFormat } from "../../lib/output-format.js";
 import { createToolRoute } from "../tool-factory.js";
 
@@ -35,7 +36,7 @@ const settingsSchema = z.object({
 
 type EnhancementSettings = z.infer<typeof settingsSchema>;
 
-async function processImageEnhancement(
+export async function processImageEnhancement(
   rawBuffer: Buffer,
   settings: EnhancementSettings,
   filename: string,
@@ -132,8 +133,17 @@ async function processImageEnhancement(
           colorNoise: 20,
         });
         buffer = result.buffer;
-      } catch {
-        // SCUNet unavailable, fall back to the Sharp-only result
+      } catch (err) {
+        // isToolInstalled() already gated out the genuinely-missing case, so
+        // whatever lands here is a pass that was meant to run and broke (a
+        // sidecar crash, an OOM, a bad scratch dir). The Sharp-only fallback is
+        // still the right response, but swallowing the error silently returned
+        // a 200 with no trace anywhere (#1224); log it so the failure shows up
+        // in the API logs instead of vanishing.
+        logger.warn(
+          { err, toolId: "image-enhancement" },
+          "deep enhance failed, returning the Sharp-only result",
+        );
       } finally {
         await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
       }
