@@ -329,6 +329,14 @@ export async function migrateFromSqlite(
           detached.push(...detachTwinIdentities(convertedUsers, await heldIdentities(tx)));
         }
 
+        // Count what the target already holds so the guard below measures the
+        // delta this import inserted, not the whole table. Under --force the
+        // target is pre-populated, so a whole-table count(*) stays above
+        // rows.length however many rows go missing (issue #1217).
+        const before = (
+          await tx.execute(sql`SELECT count(*)::int AS n FROM ${sql.raw(`"${table}"`)}`)
+        ).rows[0].n as number;
+
         for (let i = 0; i < rows.length; i++) {
           const converted = convertedUsers ? convertedUsers[i] : convertRow(table, rows[i]);
           // Self-adjusting: insert only columns that exist in the live target, so a
@@ -354,10 +362,13 @@ export async function migrateFromSqlite(
         const count = (
           await tx.execute(sql`SELECT count(*)::int AS n FROM ${sql.raw(`"${table}"`)}`)
         ).rows[0].n as number;
-        if (count < rows.length) {
-          throw new Error(`Row count mismatch for ${table}: sqlite=${rows.length} pg=${count}`);
+        const inserted = count - before;
+        if (inserted < rows.length) {
+          throw new Error(
+            `Row count mismatch for ${table}: sqlite=${rows.length} inserted=${inserted}`,
+          );
         }
-        result.tables[table] = rows.length;
+        result.tables[table] = inserted;
       }
     });
   } finally {
