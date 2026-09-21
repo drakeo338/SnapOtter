@@ -20,11 +20,12 @@ vi.mock("@/lib/api", () => ({
 
 vi.mock("@/lib/utils", async (importOriginal) => {
   const actual: Record<string, unknown> = await importOriginal();
-  return { ...actual, generateId: () => "33333333-3333-4333-8333-333333333333" };
+  return { ...actual, generateId: vi.fn(() => "33333333-3333-4333-8333-333333333333") };
 });
 
 import { useToolProcessor } from "@/hooks/use-tool-processor";
 import { track } from "@/lib/analytics";
+import { generateId } from "@/lib/utils";
 import { useFileStore } from "@/stores/file-store";
 
 interface MockXhr {
@@ -232,7 +233,14 @@ describe("useToolProcessor batch recovery (#750)", () => {
       .mocked(track)
       .mock.calls.filter(([event]) => event === "batch_processed");
     expect(batchEvents).toHaveLength(1);
-    expect(batchEvents[0][1]).toMatchObject({ status: "completed" });
+    // total_bytes is the sum of the two 16-byte inputs; a completed run
+    // carries no failure reason (#1161).
+    expect(batchEvents[0][1]).toEqual({
+      tool_id: "resize",
+      file_count: 2,
+      status: "completed",
+      total_bytes: 32,
+    });
 
     unmount();
   });
@@ -308,6 +316,78 @@ describe("useToolProcessor batch recovery (#750)", () => {
     expect(useFileStore.getState().processing).toBe(false);
 
     unmount();
+  });
+
+  it("reports an abandoned run on batch_processed with the unconfirmed reason (#945, #1161)", () => {
+    vi.useFakeTimers();
+    const { unmount } = startBatchRun();
+
+    act(() => {
+      xhrs[0].upload.onload?.();
+      xhrs[0].onerror?.();
+      latestSse().onmessage?.({
+        data: JSON.stringify({ type: "heartbeat" }),
+      } as MessageEvent);
+      vi.advanceTimersByTime(30_001);
+    });
+
+    // The evidence timer ends the run, so it must land in analytics like
+    // every other terminal path; a run that vanishes from batch_processed
+    // is exactly the failure mode the event exists to count.
+    expect(vi.mocked(track)).toHaveBeenCalledWith("batch_processed", {
+      tool_id: "resize",
+      file_count: 2,
+      status: "failed",
+      reason: "unconfirmed",
+      total_bytes: 32,
+    });
+
+    unmount();
+  });
+
+  it("lets a later single run's evidence timer settle that run, not a stale batch closure", () => {
+    vi.useFakeTimers();
+    const files = [
+      new File([new ArrayBuffer(16)], "first.png", { type: "image/png" }),
+      new File([new ArrayBuffer(16)], "second.jpg", { type: "image/jpeg" }),
+    ];
+    useFileStore.getState().setFiles(files);
+    const hook = renderHook(() => useToolProcessor("resize"));
+    // Two runs, two ids: the closure guard is what is under test here.
+    vi.mocked(generateId)
+      .mockReturnValueOnce(JOB_ID)
+      .mockReturnValueOnce("44444444-4444-4444-8444-444444444444");
+
+    // A batch run degrades, then the user starts a single run on top of it
+    // without the batch ever settling, so the batch closure is stale.
+    act(() => {
+      void hook.result.current.processAllFiles(files, { width: 50 });
+    });
+    act(() => {
+      xhrs[0].upload.onload?.();
+      xhrs[0].onerror?.();
+    });
+    act(() => {
+      hook.result.current.processFiles([files[0]], { width: 50 });
+    });
+    act(() => {
+      xhrs[1].upload.onload?.();
+      xhrs[1].onerror?.();
+      vi.advanceTimersByTime(30_001);
+    });
+
+    // The single run is the one the timer belongs to: it settles, and the
+    // old batch does not get a spurious batch_processed on its behalf.
+    expect(useFileStore.getState().processing).toBe(false);
+    expect(useFileStore.getState().error).toBe(
+      "Processing was interrupted and the server never confirmed the job. Retry when reconnected.",
+    );
+    expect(vi.mocked(track)).not.toHaveBeenCalledWith(
+      "batch_processed",
+      expect.objectContaining({ reason: "unconfirmed" }),
+    );
+
+    hook.unmount();
   });
 
   it("skips the evidence timer when a batch frame already proved the batch exists", () => {
@@ -474,6 +554,94 @@ describe("useToolProcessor batch recovery (#750)", () => {
       "Processing was interrupted. Retry when reconnected.",
     );
     expect(useFileStore.getState().processing).toBe(false);
+
+    unmount();
+  });
+
+  it("degrades a batch 524 whose blob body is not JSON (#1161)", async () => {
+    const { unmount } = startBatchRun();
+
+    // Cloudflare answers 524 with an HTML page when the origin holds the
+    // batch response past its 100 s limit. The batch keeps running
+    // server-side exactly as it does behind an nginx 504, so the client
+    // must ride the SSE instead of failing the run.
+    act(() => {
+      xhrs[0].upload.onload?.();
+      xhrs[0].status = 524;
+      xhrs[0].response = new Blob(["<html><body>524 A timeout occurred</body></html>"], {
+        type: "text/html",
+      });
+      xhrs[0].onload?.();
+    });
+
+    await settled(() => {
+      expect(vi.mocked(track)).toHaveBeenCalledWith("tool_run_degraded", {
+        tool_id: "resize",
+        is_batch: true,
+        trigger: "http-524",
+        had_evidence: false,
+      });
+    });
+    expect(useFileStore.getState().error).toBeNull();
+    expect(useFileStore.getState().processing).toBe(true);
+
+    unmount();
+  });
+
+  it("reports the HTTP status as the failure reason when the app answers with an error (#1161)", async () => {
+    const { unmount } = startBatchRun();
+
+    act(() => {
+      xhrs[0].upload.onload?.();
+      xhrs[0].status = 422;
+      xhrs[0].response = new Blob([JSON.stringify({ error: "All files failed processing" })], {
+        type: "application/json",
+      });
+      xhrs[0].onload?.();
+    });
+
+    await settled(() => {
+      expect(useFileStore.getState().processing).toBe(false);
+    });
+    expect(vi.mocked(track)).toHaveBeenCalledWith("batch_processed", {
+      tool_id: "resize",
+      file_count: 2,
+      status: "failed",
+      reason: "http-422",
+      total_bytes: 32,
+    });
+
+    unmount();
+  });
+
+  it("reports the server's error code as the reason when the body carries one (#1161)", async () => {
+    const { unmount } = startBatchRun();
+
+    act(() => {
+      xhrs[0].upload.onload?.();
+      xhrs[0].status = 503;
+      xhrs[0].response = new Blob(
+        [JSON.stringify({ error: "Workspace storage limit reached", code: "workspace-cap" })],
+        { type: "application/json" },
+      );
+      xhrs[0].onload?.();
+    });
+
+    // A JSON 5xx is the app speaking, never an intermediary: it must fail
+    // the run with its message, not degrade, and the code beats the bare
+    // status so the cap and the disk floor stay apart in analytics.
+    await settled(() => {
+      expect(useFileStore.getState().processing).toBe(false);
+    });
+    expect(useFileStore.getState().error).toBe("error");
+    expect(vi.mocked(track)).not.toHaveBeenCalledWith("tool_run_degraded", expect.anything());
+    expect(vi.mocked(track)).toHaveBeenCalledWith("batch_processed", {
+      tool_id: "resize",
+      file_count: 2,
+      status: "failed",
+      reason: "workspace-cap",
+      total_bytes: 32,
+    });
 
     unmount();
   });
