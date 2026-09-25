@@ -329,14 +329,12 @@ export async function migrateFromSqlite(
           detached.push(...detachTwinIdentities(convertedUsers, await heldIdentities(tx)));
         }
 
-        // Count what the target already holds so the guard below measures the
-        // delta this import inserted, not the whole table. Under --force the
-        // target is pre-populated, so a whole-table count(*) stays above
-        // rows.length however many rows go missing (issue #1217).
-        const before = (
-          await tx.execute(sql`SELECT count(*)::int AS n FROM ${sql.raw(`"${table}"`)}`)
-        ).rows[0].n as number;
-
+        // Sum what each INSERT reports rather than counting the table. Under
+        // --force the target is pre-populated, so a whole-table count(*) stays
+        // above rows.length however many rows go missing (issue #1217), and a
+        // before/after count(*) delta would also pick up rows other sessions
+        // commit or delete meanwhile on a live instance.
+        let inserted = 0;
         for (let i = 0; i < rows.length; i++) {
           const converted = convertedUsers ? convertedUsers[i] : convertRow(table, rows[i]);
           // Self-adjusting: insert only columns that exist in the live target, so a
@@ -355,14 +353,11 @@ export async function migrateFromSqlite(
             }),
             sql.raw(", "),
           );
-          await tx.execute(
+          const res = await tx.execute(
             sql`INSERT INTO ${sql.raw(`"${table}"`)} (${colList}) VALUES (${values})`,
           );
+          inserted += res.rowCount ?? 0;
         }
-        const count = (
-          await tx.execute(sql`SELECT count(*)::int AS n FROM ${sql.raw(`"${table}"`)}`)
-        ).rows[0].n as number;
-        const inserted = count - before;
         if (inserted < rows.length) {
           throw new Error(
             `Row count mismatch for ${table}: sqlite=${rows.length} inserted=${inserted}`,
