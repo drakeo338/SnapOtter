@@ -9,6 +9,7 @@ import sharp from "sharp";
 import { z } from "zod";
 import { runPerFrame } from "../../lib/animated-image.js";
 import { autoOrient } from "../../lib/auto-orient.js";
+import { reportError } from "../../lib/error-report.js";
 import { isToolInstalled } from "../../lib/feature-status.js";
 import { validateImageBuffer } from "../../lib/file-validation.js";
 import { decodeToSharpCompat, needsCliDecode } from "../../lib/format-decoders.js";
@@ -134,16 +135,16 @@ export async function processImageEnhancement(
         });
         buffer = result.buffer;
       } catch (err) {
-        // isToolInstalled() already gated out the genuinely-missing case, so
-        // whatever lands here is a pass that was meant to run and broke (a
-        // sidecar crash, an OOM, a bad scratch dir). The Sharp-only fallback is
-        // still the right response, but swallowing the error silently returned
-        // a 200 with no trace anywhere (#1224); log it so the failure shows up
-        // in the API logs instead of vanishing.
+        // isToolInstalled() only filters out bundles the install record says
+        // are absent, so what lands here is a pass that was meant to run and
+        // broke: a sidecar crash, an OOM, a bad scratch dir, missing or corrupt
+        // model files. The Sharp-only result is still the right response, but
+        // the failure has to stay visible in the logs and in Sentry.
         logger.warn(
           { err, toolId: "image-enhancement" },
           "deep enhance failed, returning the Sharp-only result",
         );
+        void reportError(err, { source: "worker", toolId: "image-enhancement" });
       } finally {
         await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
       }

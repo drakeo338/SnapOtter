@@ -1,17 +1,15 @@
 /**
  * A failed deep-enhance pass must leave a trace (#1224).
  *
- * When Deep Enhance is on and the noise-removal sidecar throws, the tool
- * correctly falls back to the Sharp-only result and returns it. The bug was
- * that it did so silently: an empty `catch {}` swallowed a real sidecar crash,
- * OOM or bad scratch dir, so the caller got a 200 and nothing in the logs or
- * Sentry recorded that the feature they asked for never ran.
+ * When Deep Enhance is on and the noise-removal sidecar throws, the tool falls
+ * back to the Sharp-only result and returns it. That fallback must not be
+ * silent: the failure goes to the API logs and to Sentry via reportError.
  *
- * isToolInstalled() already gates out the genuinely-missing-model case before
- * the try, so this test forces the branch to run (isToolInstalled -> true) and
- * makes the sidecar reject. It asserts both halves: the fallback still returns
- * a usable result (no throw), and the failure is logged with the error
- * attached. With the empty catch restored, the logger.warn assertion fails.
+ * The test forces the branch to run (isToolInstalled -> true) and makes the
+ * sidecar reject. It asserts the fallback still returns a usable result (no
+ * throw) and that the failure is both logged and reported with the error
+ * attached. A second case pins the success path: the sidecar's result is used
+ * and nothing is logged or reported.
  */
 
 import { noiseRemoval } from "@snapotter/ai";
@@ -58,6 +56,14 @@ const loggerMock = vi.hoisted(() => ({
 }));
 vi.mock("../../../apps/api/src/lib/logger.js", () => ({ logger: loggerMock }));
 
+// The real reportError would reach for the analytics gate and @sentry/node.
+const errorReportMock = vi.hoisted(() => ({
+  classifyError: vi.fn(),
+  reportError: vi.fn(),
+  safeFormatTag: vi.fn(),
+}));
+vi.mock("../../../apps/api/src/lib/error-report.js", () => errorReportMock);
+
 import { processImageEnhancement } from "../../../apps/api/src/routes/tools/image-enhancement.js";
 
 const settings = {
@@ -87,7 +93,7 @@ beforeEach(() => {
 });
 
 describe("deep-enhance failure leaves a trace (#1224)", () => {
-  it("falls back to the Sharp-only result and logs the sidecar failure", async () => {
+  it("falls back to the Sharp-only result and logs and reports the sidecar failure", async () => {
     vi.mocked(noiseRemoval).mockRejectedValue(new Error("SCUNet boom"));
 
     const png = await tinyPng();
@@ -113,5 +119,30 @@ describe("deep-enhance failure leaves a trace (#1224)", () => {
       }),
       expect.stringContaining("deep enhance failed"),
     );
+
+    // And it reaches Sentry through the one deliberate capture path.
+    expect(errorReportMock.reportError).toHaveBeenCalledTimes(1);
+    expect(errorReportMock.reportError).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "SCUNet boom" }),
+      expect.objectContaining({ source: "worker", toolId: "image-enhancement" }),
+    );
+  });
+
+  it("uses the sidecar result and stays quiet when deep enhance succeeds", async () => {
+    const deepResult = await sharp({
+      create: { width: 3, height: 5, channels: 3, background: { r: 0, g: 200, b: 0 } },
+    })
+      .png()
+      .toBuffer();
+    vi.mocked(noiseRemoval).mockResolvedValue({ buffer: deepResult } as Awaited<
+      ReturnType<typeof noiseRemoval>
+    >);
+
+    const result = await processImageEnhancement(await tinyPng(), settings, "test.png");
+
+    expect(noiseRemoval).toHaveBeenCalledOnce();
+    expect(result.buffer.equals(deepResult)).toBe(true);
+    expect(loggerMock.warn).not.toHaveBeenCalled();
+    expect(errorReportMock.reportError).not.toHaveBeenCalled();
   });
 });
