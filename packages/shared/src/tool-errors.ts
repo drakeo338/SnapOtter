@@ -58,3 +58,14 @@ export function isToolInputError(err: unknown): err is Error & { isToolInputErro
 export function markToolInputError<E extends Error>(err: E): E {
   return Object.assign(err, { isToolInputError: true });
 }
+
+/**
+ * True when the error carries a 5xx `statusCode` (storage full, engine
+ * unavailable, ...). Tool routes rethrow these from their catch-all so the
+ * error handler answers with the real status instead of a 422 that blames the
+ * user's file.
+ */
+export function hasServerErrorStatus(err: unknown): err is Error & { statusCode: number } {
+  const code = (err as { statusCode?: unknown } | null)?.statusCode;
+  return err instanceof Error && typeof code === "number" && code >= 500 && code <= 599;
+}

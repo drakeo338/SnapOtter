@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance } from "fastify";
 import sharp, { type Blend } from "sharp";
 import { z } from "zod";
@@ -179,6 +180,7 @@ export function registerCompose(app: FastifyInstance) {
       if (err instanceof InputValidationError) {
         return sendInputValidationError(reply, err, "compose", request.log);
       }
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "Processing failed",
         details: err instanceof Error ? err.message : "Image processing failed",

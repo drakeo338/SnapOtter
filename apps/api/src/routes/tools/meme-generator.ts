@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance } from "fastify";
 import sharp from "sharp";
 import { z } from "zod";
@@ -356,6 +357,7 @@ export function registerMemeGenerator(app: FastifyInstance) {
       });
     } catch (err) {
       if (isDecoderUnavailable(err)) throw err;
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "Processing failed",
         details: err instanceof Error ? err.message : "Meme generation failed",

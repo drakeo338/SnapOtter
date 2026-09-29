@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { apiToolPath, kbToBytes } from "@snapotter/shared";
+import { apiToolPath, hasServerErrorStatus, kbToBytes } from "@snapotter/shared";
 import archiver from "archiver";
 import type { FastifyInstance } from "fastify";
 import PDFDocument from "pdfkit";
@@ -361,6 +361,7 @@ export function registerImageToPdfRoute(
       });
     } catch (err) {
       if (isDecoderUnavailable(err)) throw err;
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "PDF creation failed",
         details: err instanceof Error ? err.message : "Unknown error",

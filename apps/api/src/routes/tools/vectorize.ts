@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { vectorize as vtrace } from "@neplex/vectorizer";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance } from "fastify";
 import potrace from "potrace";
 import sharp from "sharp";
@@ -164,6 +165,7 @@ export function registerVectorize(app: FastifyInstance) {
       if (err instanceof InputValidationError) {
         return sendInputValidationError(reply, err, "vectorize", request.log);
       }
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "Vectorization failed",
         details: err instanceof Error ? err.message : "Unknown error",

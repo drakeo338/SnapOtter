@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { apiToolPath } from "@snapotter/shared";
+import { apiToolPath, hasServerErrorStatus } from "@snapotter/shared";
 import archiver from "archiver";
 import type { FastifyInstance } from "fastify";
 import PQueue from "p-queue";
@@ -490,6 +490,7 @@ export function registerSvgToRasterRoute(
         processedSize: buffer.length,
       });
     } catch (err) {
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "SVG conversion failed",
         details: err instanceof Error ? err.message : "Unknown error",

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance } from "fastify";
 import sharp, { type OverlayOptions } from "sharp";
 import { z } from "zod";
@@ -303,6 +304,7 @@ export function registerStitch(app: FastifyInstance) {
       });
     } catch (err) {
       if (isDecoderUnavailable(err)) throw err;
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "Stitch creation failed",
         details: stripInternalPaths(err instanceof Error ? err.message : "Unknown error"),

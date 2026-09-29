@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import sharp from "sharp";
 import { z } from "zod";
@@ -228,6 +229,7 @@ export function registerEditMetadata(app: FastifyInstance) {
           processedSize: outputBuffer.length,
         });
       } catch (err) {
+        if (hasServerErrorStatus(err)) throw err;
         request.log.error({ err, toolId: "edit-metadata" }, "Metadata edit failed");
         return reply.status(422).send({
           error: "Metadata edit failed",

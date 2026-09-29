@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance } from "fastify";
 import sharp from "sharp";
 import { sendInputValidationError } from "../../lib/engine-unavailable.js";
@@ -136,6 +137,7 @@ export function registerCompare(app: FastifyInstance) {
       if (err instanceof InputValidationError) {
         return sendInputValidationError(reply, err, "compare", request.log);
       }
+      if (hasServerErrorStatus(err)) throw err;
       return reply.status(422).send({
         error: "Comparison failed",
         details: err instanceof Error ? err.message : "Unknown error",

@@ -3,6 +3,7 @@ import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { seamCarve } from "@snapotter/ai";
+import { hasServerErrorStatus } from "@snapotter/shared";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { autoOrient } from "../../lib/auto-orient.js";
@@ -150,6 +151,7 @@ export function registerContentAwareResize(app: FastifyInstance) {
           await rm(scratchDir, { recursive: true, force: true }).catch(() => {});
         }
       } catch (err) {
+        if (hasServerErrorStatus(err)) throw err;
         request.log.error({ err, toolId: "content-aware-resize" }, "Content-aware resize failed");
         return reply.status(422).send({
           error: "Content-aware resize failed",

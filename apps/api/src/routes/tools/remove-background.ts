@@ -3,7 +3,12 @@ import { mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeBackground } from "@snapotter/ai";
-import { BG_REMOVAL_MODELS, getBundleForTool, TOOL_BUNDLE_MAP } from "@snapotter/shared";
+import {
+  BG_REMOVAL_MODELS,
+  getBundleForTool,
+  hasServerErrorStatus,
+  TOOL_BUNDLE_MAP,
+} from "@snapotter/shared";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { registerAiJobHandler } from "../../jobs/ai-handlers.js";
@@ -386,6 +391,7 @@ export function registerRemoveBackground(app: FastifyInstance) {
         });
       } catch (err) {
         if (isDecoderUnavailable(err)) throw err;
+        if (hasServerErrorStatus(err)) throw err;
         request.log.error({ err }, "Effects processing failed");
         return reply.status(422).send({
           error: "Effects processing failed",
