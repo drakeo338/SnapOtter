@@ -1,5 +1,5 @@
 import { Download, Loader2, PackageOpen } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CollapsibleSection } from "@/components/common/collapsible-section";
 import { useTranslation } from "@/contexts/i18n-context";
 import { formatHeaders } from "@/lib/api";
@@ -68,6 +68,9 @@ export function SplitSettings() {
   } = useSplitStore();
 
   const [downloadingIndex, setDownloadingIndex] = useState<number | null>(null);
+  const downloadingTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  useEffect(() => () => clearTimeout(downloadingTimer.current), []);
 
   const hasFile = files.length > 0;
   const grid = getEffectiveGrid();
@@ -222,7 +225,8 @@ export function SplitSettings() {
         outputFormat === "original" ? (files[0]?.name?.split(".").pop() ?? "png") : outputFormat;
       a.download = `${baseName}_r${tile.row}_c${tile.col}.${ext}`;
       a.click();
-      setTimeout(() => setDownloadingIndex(null), 500);
+      clearTimeout(downloadingTimer.current);
+      downloadingTimer.current = setTimeout(() => setDownloadingIndex(null), 500);
       // Deliberately claims nothing. One tile is not the set, and the claim is
       // per tool, so claiming here would drop the warning for the tiles the
       // user never took. Tracking which tiles have been taken is the right

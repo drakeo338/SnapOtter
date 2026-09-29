@@ -186,6 +186,46 @@ describe("split download controls", () => {
     expect((claim as WeakRef<object>).deref()).toBe(useSplitStore.getState().tiles);
   });
 
+  describe("the busy flag reset timer", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("leaves no timer running once the panel unmounts", () => {
+      vi.useFakeTimers();
+      const { getByTitle, unmount } = renderWithTiles();
+
+      fireEvent.click(getByTitle("Download tile 1"));
+      // jsdom queues a 0 ms timer of its own for the anchor click. Let it run,
+      // so only the panel's 500 ms reset is left to count.
+      act(() => {
+        vi.advanceTimersByTime(0);
+      });
+      unmount();
+
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("does not let the first tile's timer cut the second tile's busy flag short", () => {
+      vi.useFakeTimers();
+      const { getByTitle } = renderWithTiles();
+      const bounces = (title: string) =>
+        getByTitle(title).querySelector("svg")?.getAttribute("class")?.includes("animate-bounce");
+
+      fireEvent.click(getByTitle("Download tile 1"));
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      fireEvent.click(getByTitle("Download tile 2"));
+      // 600 ms after the first click, 300 ms after the second.
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+
+      expect(bounces("Download tile 2")).toBe(true);
+    });
+  });
+
   it("warns again on the tiles a second run produces", () => {
     const { getByText } = renderWithTiles();
     fireEvent.click(getByText("Download All as ZIP"));
