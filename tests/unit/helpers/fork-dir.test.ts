@@ -215,6 +215,12 @@ describe("this worker's own workspace", () => {
     expect(forkDirOwner(path.basename(path.dirname(workspace)))).toBe(process.pid);
   });
 
+  it("keeps DATA_DIR and LOG_DIR under the same per-fork directory", () => {
+    const forkRoot = path.dirname(process.env.WORKSPACE_PATH as string);
+    expect(process.env.DATA_DIR).toBe(path.join(forkRoot, "data"));
+    expect(process.env.LOG_DIR).toBe(path.join(forkRoot, "logs"));
+  });
+
   it("has its cleanup handlers installed by per-fork-env", () => {
     expect(process.listenerCount("SIGTERM")).toBeGreaterThanOrEqual(1);
     expect(process.listenerCount("exit")).toBeGreaterThanOrEqual(1);
