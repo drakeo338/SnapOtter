@@ -362,6 +362,10 @@ def _process_cgroup_memory_limits() -> list[int] | None:
                 raise ValueError("malformed cgroup memory capacity")
             if raw != "max" and raw.isdecimal() and int(raw) > 0:
                 limits.append(int(raw))
+        except FileNotFoundError:
+            # The cgroup v2 root has no memory.max; every other level must.
+            if current != mount_point or filename != "memory.max":
+                unreadable = True
         except (OSError, UnicodeError, ValueError):
             unreadable = True
         if current == mount_point:

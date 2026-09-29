@@ -612,12 +612,38 @@ class InstallRuntimeTests(unittest.TestCase):
                 6 * gib
             ),
             "/sys/fs/cgroup/system.slice/memory.max": str(5 * gib),
-            "/sys/fs/cgroup/memory.max": "max\n",
         }
         with mock.patch.object(os, "sysconf", side_effect=[8 * gib, 1]), mock.patch.object(
             Path, "read_text", new=read_from(host_files)
         ):
             self.assertEqual(install_runtime._effective_memory_bytes(), 5 * gib)
+
+    def test_effective_memory_fails_closed_when_a_non_root_limit_is_missing(
+        self,
+    ) -> None:
+        gib = 1024 * 1024 * 1024
+        files = {
+            "/proc/self/cgroup": "0::/system.slice/docker-deadbeef.scope\n",
+            "/proc/self/mountinfo": (
+                "29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime "
+                "- cgroup2 cgroup rw\n"
+            ),
+            "/sys/fs/cgroup/system.slice/docker-deadbeef.scope/memory.max": str(
+                6 * gib
+            ),
+        }
+
+        def read_text(path, *args, **kwargs):
+            value = files.get(str(path))
+            if value is None:
+                raise FileNotFoundError(path)
+            return value
+
+        with mock.patch.object(os, "sysconf", side_effect=[8 * gib, 1]), mock.patch.object(
+            Path, "read_text", new=read_text
+        ):
+            with self.assertRaisesRegex(install_runtime.PreflightError, "cgroup memory"):
+                install_runtime._effective_memory_bytes()
 
     def test_effective_memory_fails_closed_for_unreadable_identified_controller(
         self,
