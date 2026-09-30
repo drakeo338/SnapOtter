@@ -1,7 +1,15 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { type ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { Writable } from "node:stream";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  type Context,
+  type ContextManager,
+  context,
+  createContextKey,
+  ROOT_CONTEXT,
+} from "@opentelemetry/api";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 // Mock child_process.spawn before importing the bridge module
 vi.mock("node:child_process", () => ({
@@ -12,6 +20,35 @@ vi.mock("node:child_process", () => ({
 vi.mock("sharp", () => ({
   default: vi.fn(),
 }));
+
+/**
+ * Minimal AsyncLocalStorage-based context manager for tests, as in
+ * log-trace-mixin.test.ts. Without one, OTel's context.with() is a no-op.
+ */
+class TestContextManager implements ContextManager {
+  private _als = new AsyncLocalStorage<Context>();
+  active(): Context {
+    return this._als.getStore() ?? ROOT_CONTEXT;
+  }
+  with<A extends unknown[], F extends (...args: A) => ReturnType<F>>(
+    ctx: Context,
+    fn: F,
+    thisArg?: ThisParameterType<F>,
+    ...args: A
+  ): ReturnType<F> {
+    return this._als.run(ctx, () => fn.call(thisArg, ...args));
+  }
+  bind<T>(_ctx: Context, target: T): T {
+    return target;
+  }
+  enable(): this {
+    return this;
+  }
+  disable(): this {
+    this._als.disable();
+    return this;
+  }
+}
 
 // Helper to create a fake ChildProcess with controllable streams
 function createMockProcess(): {
@@ -1116,6 +1153,120 @@ describe("bridge - dispatcher lifecycle via runPythonWithProgress", () => {
     logSpy.mockRestore();
   });
 
+  it("sends dispatcher diagnostics to the installed log sink, not the console (#1500)", async () => {
+    const mockDispatcher = createMockProcess();
+    const mockPerReq = createMockProcess();
+    let callCount = 0;
+
+    vi.mocked(spawn).mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) return mockDispatcher.process;
+      return mockPerReq.process;
+    });
+
+    // Same module instance the freshly imported bridge uses.
+    const { setAiLogger } = await import("../../../packages/ai/src/log.js");
+    const sink = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    setAiLogger(sink);
+    onTestFinished(() => setAiLogger(null));
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => {});
+    const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const promise = runPythonWithProgress("test.py", []);
+
+    mockDispatcher.stderr.emit(
+      "data",
+      Buffer.from(
+        '{"info": "model cached"}\n{"warning": "low memory"}\n[model] Loading weights...\n',
+      ),
+    );
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    mockPerReq.stdout.emit("data", Buffer.from('{"ok": true}\n'));
+    mockPerReq.emitEvent("close", 0, null);
+    await promise;
+
+    const messages = (fn: typeof sink.info) => fn.mock.calls.map((call) => call[0]);
+    expect(messages(sink.info)).toEqual(
+      expect.arrayContaining(["[python] model cached", "[python] [model] Loading weights..."]),
+    );
+    expect(messages(sink.warn)).toEqual(["[python] low memory"]);
+    expect(consoleLog).not.toHaveBeenCalled();
+    expect(consoleWarn).not.toHaveBeenCalled();
+  });
+
+  it("sends a dispatcher spawn error to the installed log sink (#1500)", async () => {
+    const mockDispatcher = createMockProcess();
+    const mockPerRequest = createMockProcess();
+    let callCount = 0;
+
+    vi.mocked(spawn).mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) return mockDispatcher.process;
+      return mockPerRequest.process;
+    });
+
+    const { setAiLogger } = await import("../../../packages/ai/src/log.js");
+    const sink = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    setAiLogger(sink);
+    onTestFinished(() => setAiLogger(null));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const promise = runPythonWithProgress("test.py", []);
+
+    const enoent = new Error("spawn ENOENT") as NodeJS.ErrnoException;
+    enoent.code = "ENOENT";
+    enoent.syscall = "spawn /opt/venv/bin/python3";
+    mockDispatcher.emitEvent("error", enoent);
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    mockPerRequest.stdout.emit("data", Buffer.from('{"ok": true}\n'));
+    mockPerRequest.emitEvent("close", 0, null);
+    await promise;
+
+    // The error itself, not just its message, so pino keeps its syscall and stack.
+    expect(sink.error).toHaveBeenCalledWith(
+      "[bridge] Dispatcher error: spawn ENOENT (code: ENOENT)",
+      enoent,
+    );
+    expect(consoleError).not.toHaveBeenCalled();
+  });
+
+  it("spawns the dispatcher outside the requesting job's trace context (#1500)", async () => {
+    // The child outlives the job that happened to start it. Its pipe events
+    // run in the context spawn() was called in, so spawning inside a job
+    // would stamp that job's trace id on every line the dispatcher logs.
+    context.setGlobalContextManager(new TestContextManager());
+    onTestFinished(() => {
+      context.disable();
+    });
+    const jobKey = createContextKey("job");
+    const spawnedIn: unknown[] = [];
+    const mockDispatcher = createMockProcess();
+    const mockPerReq = createMockProcess();
+
+    vi.mocked(spawn).mockImplementation(() => {
+      spawnedIn.push(context.active().getValue(jobKey));
+      return spawnedIn.length === 1 ? mockDispatcher.process : mockPerReq.process;
+    });
+
+    const promise = context.with(ROOT_CONTEXT.setValue(jobKey, "job-1"), () =>
+      runPythonWithProgress("test.py", []),
+    );
+
+    await new Promise((r) => setTimeout(r, 10));
+
+    mockPerReq.stdout.emit("data", Buffer.from('{"ok": true}\n'));
+    mockPerReq.emitEvent("close", 0, null);
+    await promise;
+
+    // The per-request fallback belongs to this job and keeps its context,
+    // which also shows the context manager is live.
+    expect(spawnedIn).toEqual([undefined, "job-1"]);
+  });
+
   it("dispatcher stderr collects non-JSON non-bracket lines as error output", async () => {
     const mockDispatcher = createMockProcess();
     const mockPerReq = createMockProcess();
@@ -1845,6 +1996,10 @@ describe("bridge - max consecutive crash threshold", () => {
     // Use fake timers so all crashes happen within the 60s window.
     // Also need to advance past backoff between crashes.
     vi.useFakeTimers();
+    const { setAiLogger } = await import("../../../packages/ai/src/log.js");
+    const sink = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    setAiLogger(sink);
+    onTestFinished(() => setAiLogger(null));
 
     // We need enough mocks: each crash cycle uses 2 (dispatcher + per-request)
     // but after crash, backoff applies. We need to advance past each backoff
@@ -1888,6 +2043,16 @@ describe("bridge - max consecutive crash threshold", () => {
     const status = getDispatcherStatus();
     expect(status.failed).toBe(true);
     expect(status.consecutiveCrashes).toBeGreaterThanOrEqual(5);
+    // Each crash, and giving up, reaches the log sink (#1500).
+    expect(sink.warn.mock.calls.map((call) => call[0])).toEqual([
+      "[bridge] Dispatcher crash #1, backing off 1000ms before restart",
+      "[bridge] Dispatcher crash #2, backing off 2000ms before restart",
+      "[bridge] Dispatcher crash #3, backing off 4000ms before restart",
+      "[bridge] Dispatcher crash #4, backing off 8000ms before restart",
+    ]);
+    expect(sink.error.mock.calls.map((call) => call[0])).toEqual([
+      "[bridge] Dispatcher crashed 5 times in 60s, disabling permanently",
+    ]);
 
     vi.useRealTimers();
   });

@@ -15,10 +15,12 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { APP_VERSION } from "@snapotter/shared";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { setAiLogger } from "../../../packages/ai/src/log.js";
 import type { OcrRuntimeTrustKey } from "../../../packages/ai/src/runtime-index.js";
 import {
   getOcrRuntimeCapability,
+  OCR_RUNTIME_PROTOCOL_VERSION,
   readActiveRuntime,
   readCommittedOcrRuntimeActivationIdentity,
   readPendingOcrRuntimeForHandoff,
@@ -984,7 +986,146 @@ describe("invalid runtime diagnostics (#1433)", () => {
     expect(warn).toHaveBeenCalledTimes(2);
   });
 
-  it("stays quiet for missing, incompatible, and unsupported-host runtimes", () => {
+  it("sends the warning to the installed log sink, not straight to the console (#1500)", () => {
+    const fixture = createRuntimeFixture();
+    writeFileSync(fixture.smallModelPath, "broken", "utf-8");
+    const consoleWarn = quietWarn();
+    const sinkWarn = vi.fn();
+    setAiLogger({ info: vi.fn(), warn: sinkWarn, error: vi.fn() });
+    onTestFinished(() => setAiLogger(null));
+
+    getOcrRuntimeCapability({ aiDataDir: fixture.aiDataDir, ...linuxX64 });
+
+    expect(sinkWarn.mock.calls.map((call) => call[0])).toEqual([
+      expect.stringMatching(
+        /^\[ocr-runtime\] .* is unavailable: model file .*small\.onnx is the wrong size$/,
+      ),
+    ]);
+    expect(consoleWarn).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, (descriptor: MutableDescriptor) => void, string]>([
+    [
+      "an older SnapOtter",
+      (descriptor) => {
+        descriptor.compatibility.snapotterVersion = "0.0.1";
+      },
+      `runtime was built for SnapOtter 0.0.1, but this is ${APP_VERSION}; reinstall Accurate OCR`,
+    ],
+    [
+      "another protocol",
+      (descriptor) => {
+        descriptor.compatibility.protocolVersion = 99;
+      },
+      `runtime speaks OCR protocol 99, but this SnapOtter speaks ${OCR_RUNTIME_PROTOCOL_VERSION}`,
+    ],
+    [
+      // An upgrade that bumps the protocol bumps the version too; both belong in the line.
+      "a newer protocol and an older SnapOtter",
+      (descriptor) => {
+        descriptor.compatibility.protocolVersion = OCR_RUNTIME_PROTOCOL_VERSION + 1;
+        descriptor.compatibility.snapotterVersion = "0.0.1";
+      },
+      `runtime speaks OCR protocol ${OCR_RUNTIME_PROTOCOL_VERSION + 1}, but this SnapOtter speaks ${OCR_RUNTIME_PROTOCOL_VERSION}; runtime was built for SnapOtter 0.0.1, but this is ${APP_VERSION}; reinstall Accurate OCR`,
+    ],
+    [
+      // A crafted value that String() can't convert stays an incompatible runtime.
+      "a version that isn't a string",
+      (descriptor) => {
+        descriptor.compatibility.snapotterVersion = { toString: 1 };
+      },
+      `runtime was built for SnapOtter {"toString":1}, but this is ${APP_VERSION}; reinstall Accurate OCR`,
+    ],
+    [
+      // Bidi and zero-width controls are flattened, so a value can't reorder the line.
+      "a platform with a bidi override in it",
+      (descriptor) => {
+        descriptor.artifact.platform = `win${String.fromCharCode(0x202e)}dows`;
+      },
+      "runtime was built for win dows, not linux",
+    ],
+    [
+      "another platform",
+      (descriptor) => {
+        descriptor.artifact.platform = "windows";
+      },
+      "runtime was built for windows, not linux",
+    ],
+  ])(
+    "logs which compatibility check rejected the runtime: %s (#1501)",
+    (_label, mutate, detail) => {
+      const fixture = createRuntimeFixture();
+      mutateDescriptor(fixture.descriptorPath, mutate);
+      const warn = quietWarn();
+      const options = { aiDataDir: fixture.aiDataDir, ...linuxX64 };
+
+      expect(getOcrRuntimeCapability(options)).toMatchObject({ reason: "artifact-incompatible" });
+      // Polled like any other capability read: one line, not one per poll.
+      getOcrRuntimeCapability(options);
+      expect(warnings(warn)).toEqual([
+        `[ocr-runtime] Accurate OCR runtime at ${join(fixture.aiDataDir, "v3")} is unavailable: ${detail}`,
+      ]);
+    },
+  );
+
+  it("names the target it was built for when the host needs another (#1501)", () => {
+    const fixture = createRuntimeFixture();
+    const warn = quietWarn();
+
+    expect(
+      getOcrRuntimeCapability({ aiDataDir: fixture.aiDataDir, platform: "linux", arch: "arm64" }),
+    ).toMatchObject({ reason: "artifact-incompatible" });
+    expect(warnings(warn)).toEqual([
+      expect.stringMatching(
+        /is unavailable: runtime was built for linux-amd64-cpu-py312 \(amd64\), but this host needs linux-arm64-cpu-py311 \(arm64\)$/,
+      ),
+    ]);
+  });
+
+  it("logs why the container's memory limit couldn't be read (#1501)", () => {
+    const fixture = createRuntimeFixture();
+    const procFiles = new Map([
+      ["/proc/self/cgroup", "0::/docker/deadbeef\n"],
+      [
+        "/proc/self/mountinfo",
+        "29 23 0:26 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw\n",
+      ],
+    ]);
+    const warn = quietWarn();
+    const options = {
+      aiDataDir: fixture.aiDataDir,
+      ...linuxX64,
+      physicalMemoryBytes: 8 * 1024 ** 3,
+      readTextFile: (path: string) => {
+        const value = procFiles.get(path);
+        if (value === undefined) throw new Error("denied");
+        return value;
+      },
+    };
+
+    expect(getOcrRuntimeCapability(options)).toMatchObject({ reason: "memory-capacity-unknown" });
+    getOcrRuntimeCapability(options);
+    expect(warnings(warn)).toEqual([
+      `[ocr-runtime] Accurate OCR runtime at ${join(fixture.aiDataDir, "v3")} is unavailable: this container's memory limit couldn't be read: unable to read the process cgroup memory capacity from /sys/fs/cgroup/docker/deadbeef/memory.max: denied`,
+    ]);
+  });
+
+  it("keeps one log slot per runtime root, so two roots don't defeat each other (#1501)", () => {
+    const first = createRuntimeFixture();
+    const second = createRuntimeFixture();
+    writeFileSync(first.smallModelPath, "broken", "utf-8");
+    writeFileSync(second.smallModelPath, "broken", "utf-8");
+    const warn = quietWarn();
+
+    for (let poll = 0; poll < 3; poll++) {
+      getOcrRuntimeCapability({ aiDataDir: first.aiDataDir, ...linuxX64 });
+      getOcrRuntimeCapability({ aiDataDir: second.aiDataDir, ...linuxX64 });
+    }
+
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("stays quiet for missing, unsupported-host, and insufficient-memory runtimes", () => {
     const warn = quietWarn();
     const empty = mkdtempSync(join(tmpdir(), "snapotter-runtime-state-empty-"));
     temporaryDirectories.push(empty);
@@ -994,11 +1135,16 @@ describe("invalid runtime diagnostics (#1433)", () => {
       reason: "descriptor-missing",
     });
     expect(
-      getOcrRuntimeCapability({ aiDataDir: fixture.aiDataDir, platform: "linux", arch: "arm64" }),
-    ).toMatchObject({ reason: "artifact-incompatible" });
-    expect(
       getOcrRuntimeCapability({ aiDataDir: fixture.aiDataDir, platform: "darwin", arch: "arm64" }),
     ).toMatchObject({ reason: "unsupported-host" });
+    // Feature status already spells this one out with both sizes.
+    expect(
+      getOcrRuntimeCapability({
+        aiDataDir: fixture.aiDataDir,
+        ...linuxX64,
+        effectiveMemoryBytes: 4 * 1024 ** 3 - 1,
+      }),
+    ).toMatchObject({ reason: "insufficient-memory" });
     expect(warn).not.toHaveBeenCalled();
   });
 

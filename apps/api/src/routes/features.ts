@@ -80,6 +80,8 @@ import {
   verifyBundleModels,
 } from "../lib/feature-status.js";
 import { evaluateInstallWatchdog } from "../lib/install-watchdog.js";
+import { logErrorWithCauses } from "../lib/log-error-with-causes.js";
+import { logger } from "../lib/logger.js";
 import { multipartFailure, multipartParts } from "../lib/multipart-parts.js";
 import {
   assertOcrRuntimeInstallDiskSpace,
@@ -160,13 +162,13 @@ async function handoffInstalledOcrRuntime(
     if (typeof rollback.restoredGeneration === "string") {
       try {
         await probeOcrDispatcher(runtimeOptions);
-      } catch {
+      } catch (probeError) {
         try {
           await rotateOcrDispatcher(runtimeOptions);
         } catch (recoveryError) {
           throw new Error(
             "OCR runtime handoff failed; the prior descriptor was restored but its local dispatcher could not be recovered",
-            { cause: new AggregateError([activationError, recoveryError]) },
+            { cause: new AggregateError([activationError, probeError, recoveryError]) },
           );
         }
       }
@@ -256,15 +258,41 @@ function startOcrInstall(bundleId: string, jobId: string, installLockFd: number)
         duration_ms: Date.now() - installStartTime,
       });
     } catch (error) {
-      if (!finalize()) return;
+      if (!finalize()) {
+        // Only the success path finalizes first, so the runtime is installed
+        // and active; what failed is the bookkeeping after it.
+        logErrorWithCauses(
+          logger,
+          { err: error, bundleId, jobId },
+          "[ocr-runtime] OCR runtime installed, but finishing the install job failed",
+        );
+        return;
+      }
+      // The UI gets the top-level message only; the log keeps the cause chain,
+      // which for a failed handoff and rollback holds both errors (#1504).
+      logErrorWithCauses(
+        logger,
+        { err: error, bundleId, jobId },
+        "[ocr-runtime] OCR install failed",
+      );
       const errorMessage = error instanceof Error ? error.message : String(error);
       setInstallProgress(bundleId, null, errorMessage);
-      await updateSingleFileProgress({
-        jobId,
-        phase: "failed",
-        percent: 0,
-        error: errorMessage,
-      });
+      try {
+        await updateSingleFileProgress({
+          jobId,
+          phase: "failed",
+          percent: 0,
+          error: errorMessage,
+        });
+      } catch (recordError) {
+        // Nothing awaits this block, so a rejection escaping it would be
+        // unhandled, and that ends the process when no handler is installed.
+        logErrorWithCauses(
+          logger,
+          { err: recordError, bundleId, jobId },
+          "[ocr-runtime] Recording the failed OCR install failed",
+        );
+      }
     } finally {
       pump();
     }
@@ -1410,7 +1438,7 @@ export async function registerFeatureRoutes(app: FastifyInstance): Promise<void>
         // rollback failures are server-side faults and must remain
         // retryable/observable as 5xx, so log and report them before
         // answering.
-        request.log.error({ err }, "Offline feature import failed");
+        logErrorWithCauses(request.log, { err }, "Offline feature import failed");
         void reportError(err, {
           source: "http",
           route: "/api/v1/admin/features/import",

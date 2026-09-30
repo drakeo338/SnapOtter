@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { dirname, posix, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { context, propagation, SpanStatusCode, trace } from "@opentelemetry/api";
+import { context, propagation, ROOT_CONTEXT, SpanStatusCode, trace } from "@opentelemetry/api";
 import { isSafeMessageError, SafeError } from "@snapotter/shared";
 import { missingBundleForScript } from "./feature-gate.js";
+import { aiLog } from "./log.js";
 import { acquireVenvRead, tryAcquireVenvRead } from "./venv-lock.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -323,7 +324,7 @@ export class PythonDispatcher {
     this.lastCrashTs = now;
 
     if (this.crashes >= MAX_CONSECUTIVE_CRASHES) {
-      console.error(
+      aiLog.error(
         `[bridge] Dispatcher crashed ${this.crashes} times in ${CRASH_WINDOW_MS / 1000}s, disabling permanently`,
       );
       this.childFailed = true;
@@ -332,9 +333,7 @@ export class PythonDispatcher {
 
     const delay = BASE_BACKOFF_MS * 2 ** (this.crashes - 1);
     this.backoffEnd = now + delay;
-    console.warn(
-      `[bridge] Dispatcher crash #${this.crashes}, backing off ${delay}ms before restart`,
-    );
+    aiLog.warn(`[bridge] Dispatcher crash #${this.crashes}, backing off ${delay}ms before restart`);
   }
 
   /**
@@ -358,15 +357,22 @@ export class PythonDispatcher {
     const gen = this.generation;
 
     try {
-      const proc = spawn(getPythonPath(), [resolve(PYTHON_DIR, "dispatcher.py")], {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: this.buildEnv(),
-      });
+      // Under the root context: the child outlives whichever job started
+      // it, and its pipe events inherit the context it was spawned in, so
+      // every line it logs would carry that one job's trace id (#1500).
+      // Each request's own trace context goes to Python with the request.
+      const proc = context.with(ROOT_CONTEXT, () =>
+        spawn(getPythonPath(), [resolve(PYTHON_DIR, "dispatcher.py")], {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: this.buildEnv(),
+        }),
+      );
 
       proc.stdin?.on("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
-          console.error(
+          aiLog.error(
             `[bridge] Dispatcher stdin pipe broken (${err.code}), rejecting pending requests`,
+            err,
           );
           this.rejectPendingForGeneration(
             gen,
@@ -411,7 +417,7 @@ export class PythonDispatcher {
                 this.childReady = true;
                 this.gpuAvail = parsed.gpu === true;
                 this.crashes = 0;
-                console.log(`[bridge] Python dispatcher ready (GPU: ${parsed.gpu === true})`);
+                aiLog.info(`[bridge] Python dispatcher ready (GPU: ${parsed.gpu === true})`);
               }
               continue;
             }
@@ -429,17 +435,17 @@ export class PythonDispatcher {
             // Diagnostic notices are forwarded so they reach docker logs
             // instead of being silently dropped for matching neither shape.
             if (typeof parsed.info === "string") {
-              console.log(`[python] ${parsed.info}`);
+              aiLog.info(`[python] ${parsed.info}`);
               continue;
             }
             if (typeof parsed.warning === "string") {
-              console.warn(`[python] ${parsed.warning}`);
+              aiLog.warn(`[python] ${parsed.warning}`);
             }
           } catch {
             // Not JSON - forward diagnostic messages to Node.js logger,
             // collect the rest as error output for pending requests.
             if (trimmed.startsWith("[")) {
-              console.log(`[python] ${trimmed}`);
+              aiLog.info(`[python] ${trimmed}`);
             }
             for (const req of this.pending.values()) {
               if (req.generation === gen) req.stderrLines.push(trimmed);
@@ -483,7 +489,7 @@ export class PythonDispatcher {
       });
 
       proc.on("error", (err: NodeJS.ErrnoException) => {
-        console.error(`[bridge] Dispatcher error: ${err.message} (code: ${err.code})`);
+        aiLog.error(`[bridge] Dispatcher error: ${err.message} (code: ${err.code})`, err);
         if (err.code === "ENOENT") {
           this.childFailed = true;
         } else if (!this.stoppedChildren.has(proc)) {
@@ -902,7 +908,7 @@ export class PythonDispatcher {
             err.message === "Python dispatcher exited unexpectedly" ||
             err.message === "Python dispatcher stdin closed unexpectedly"
           ) {
-            console.warn(
+            aiLog.warn(
               `[bridge] Dispatcher crashed during ${scriptName}, retrying with per-request process`,
             );
             return this.runPerRequest(scriptName, args, options).then((result) => ({

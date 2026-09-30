@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { APP_VERSION } from "@snapotter/shared";
+import { aiLog } from "./log.js";
 import {
   canonicalRuntimeJson,
   loadOcrRuntimeTrustKeys,
@@ -161,11 +162,9 @@ function invalidDescriptor(detail: string): DescriptorValidationFailure {
   return { descriptor: null, status: "invalid", reason: "descriptor-invalid", detail };
 }
 
-const INCOMPATIBLE_ARTIFACT: DescriptorValidationFailure = {
-  descriptor: null,
-  status: "incompatible",
-  reason: "artifact-incompatible",
-};
+function incompatibleArtifact(detail: string): DescriptorValidationFailure {
+  return { descriptor: null, status: "incompatible", reason: "artifact-incompatible", detail };
+}
 
 const INSUFFICIENT_MEMORY: DescriptorValidationFailure = {
   descriptor: null,
@@ -173,11 +172,9 @@ const INSUFFICIENT_MEMORY: DescriptorValidationFailure = {
   reason: "insufficient-memory",
 };
 
-const UNKNOWN_MEMORY_CAPACITY: DescriptorValidationFailure = {
-  descriptor: null,
-  status: "incompatible",
-  reason: "memory-capacity-unknown",
-};
+function unknownMemoryCapacity(detail: string): DescriptorValidationFailure {
+  return { descriptor: null, status: "incompatible", reason: "memory-capacity-unknown", detail };
+}
 
 const MISSING_DESCRIPTOR: ActiveRuntimeFailure = {
   descriptor: null,
@@ -861,6 +858,16 @@ function validateSignedArtifact(
   return manifest;
 }
 
+/**
+ * A descriptor value for a log detail. String() throws on a crafted object
+ * like {"toString": 1}; JSON.stringify can't, for anything JSON.parse built.
+ */
+function describeValue(value: unknown): string {
+  return typeof value === "string" || typeof value === "number"
+    ? String(value)
+    : String(JSON.stringify(value));
+}
+
 function parseOcrDescriptor(
   value: unknown,
   v3Root: string,
@@ -914,15 +921,28 @@ function parseOcrDescriptor(
   ) {
     return invalidDescriptor("active descriptor has a missing or malformed field");
   }
-  if (
-    artifact.target !== target ||
-    artifact.platform !== "linux" ||
-    artifact.arch !== expectedArch ||
-    compatibility.protocolVersion !== OCR_RUNTIME_PROTOCOL_VERSION ||
-    compatibility.snapotterVersion !== APP_VERSION
-  ) {
-    return INCOMPATIBLE_ARTIFACT;
+  // Collect every mismatch so one log line names all of them (#1501).
+  const mismatches: string[] = [];
+  if (artifact.target !== target || artifact.arch !== expectedArch) {
+    mismatches.push(
+      `runtime was built for ${artifact.target} (${artifact.arch}), but this host needs ${target} (${expectedArch})`,
+    );
   }
+  if (artifact.platform !== "linux") {
+    mismatches.push(`runtime was built for ${artifact.platform}, not linux`);
+  }
+  if (compatibility.protocolVersion !== OCR_RUNTIME_PROTOCOL_VERSION) {
+    mismatches.push(
+      `runtime speaks OCR protocol ${describeValue(compatibility.protocolVersion)}, but this SnapOtter speaks ${OCR_RUNTIME_PROTOCOL_VERSION}`,
+    );
+  }
+  if (compatibility.snapotterVersion !== APP_VERSION) {
+    // The common one: a SnapOtter upgrade leaves the installed runtime behind.
+    mismatches.push(
+      `runtime was built for SnapOtter ${describeValue(compatibility.snapotterVersion)}, but this is ${APP_VERSION}; reinstall Accurate OCR`,
+    );
+  }
+  if (mismatches.length > 0) return incompatibleArtifact(mismatches.join("; "));
 
   const signedIndexPath = resolveSignedIndex(v3Root, artifact.signedIndex);
   if (!signedIndexPath) {
@@ -943,8 +963,10 @@ function parseOcrDescriptor(
       if (!hasOcrRuntimeMemory(verified.minimumMemoryBytes, memoryOptions)) {
         return INSUFFICIENT_MEMORY;
       }
-    } catch {
-      return UNKNOWN_MEMORY_CAPACITY;
+    } catch (error) {
+      return unknownMemoryCapacity(
+        `this container's memory limit couldn't be read: ${errorMessage(error)}`,
+      );
     }
     signedArtifact = verified.artifact;
   } catch (error) {
@@ -1188,32 +1210,45 @@ export function readPendingOcrRuntimeForHandoff(
 }
 
 // The capability is polled by feature status and read on every OCR request, so
-// an invalid runtime is logged once per distinct failure, not on every read.
-// Any read that isn't descriptor-invalid clears it, so a recurrence logs again.
-let lastReportedInvalidRuntime: string | null = null;
+// an unusable runtime is logged once per distinct failure, not on every read.
+// Any read with nothing to report clears it, so a recurrence logs again. One
+// slot per v3 root, so callers that resolve different roots don't keep
+// displacing each other's line.
+const lastReportedUnavailableRuntime = new Map<string, string>();
+
+// A missing runtime or an unsupported host is the normal state of a dev
+// checkout or a Fast-OCR-only install, so those stay quiet. Insufficient
+// memory is already spelled out, with both sizes, in feature status.
+const LOGGED_UNAVAILABLE_REASONS: ReadonlySet<OcrRuntimeUnavailableReason> = new Set([
+  "descriptor-invalid",
+  "artifact-incompatible",
+  "memory-capacity-unknown",
+]);
 
 const MAX_LOGGED_DETAIL_CHARS = 500;
 
-function reportInvalidRuntime(options: RuntimeStateOptions, result: ActiveRuntimeResult): void {
-  if (result.descriptor || result.reason !== "descriptor-invalid") {
-    lastReportedInvalidRuntime = null;
+function reportUnavailableRuntime(options: RuntimeStateOptions, result: ActiveRuntimeResult): void {
+  const v3Root = join(resolveAiDataDir(options), "v3");
+  if (result.descriptor || !LOGGED_UNAVAILABLE_REASONS.has(result.reason)) {
+    lastReportedUnavailableRuntime.delete(v3Root);
     return;
   }
-  // Details can quote values read from the data volume, so control characters
-  // and line breaks are flattened and the length is capped: a crafted value
-  // can't forge log lines or flood the log.
+  // Details can quote values read from the data volume, so control and
+  // format characters (line breaks, bidi overrides, zero-width marks) are
+  // flattened and the length is capped: a crafted value can't forge, reorder,
+  // or flood log lines.
   const detail = (result.detail ?? "no detail recorded")
-    .replace(/[\p{Cc}\s]+/gu, " ")
+    .replace(/[\p{Cc}\p{Cf}\s]+/gu, " ")
     .slice(0, MAX_LOGGED_DETAIL_CHARS);
-  const message = `[ocr-runtime] Accurate OCR runtime at ${join(resolveAiDataDir(options), "v3")} is unavailable: ${detail}`;
-  if (message === lastReportedInvalidRuntime) return;
-  lastReportedInvalidRuntime = message;
-  console.warn(message);
+  const message = `[ocr-runtime] Accurate OCR runtime at ${v3Root} is unavailable: ${detail}`;
+  if (lastReportedUnavailableRuntime.get(v3Root) === message) return;
+  lastReportedUnavailableRuntime.set(v3Root, message);
+  aiLog.warn(message);
 }
 
 export function getOcrRuntimeCapability(options: RuntimeStateOptions = {}): OcrRuntimeCapability {
   const result = inspectActiveRuntime("ocr", options);
-  reportInvalidRuntime(options, result);
+  reportUnavailableRuntime(options, result);
   if (!result.descriptor) {
     return {
       available: false,

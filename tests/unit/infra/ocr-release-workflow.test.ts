@@ -1,5 +1,5 @@
 // biome-ignore-all lint/suspicious/noTemplateCurlyInString: These contract assertions intentionally match GitHub and shell interpolation syntax as literal text.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +8,19 @@ import { load } from "js-yaml";
 import { describe, expect, it } from "vitest";
 
 const root = process.cwd();
+
+/**
+ * The release workflow's shell steps assume GitHub's Ubuntu runners: bash 4 or
+ * later (they use `mapfile`), `jq` and `sha256sum`. A dev machine or fleet host
+ * may lack one (dell has no jq; mac_air's only bash is 3.2), and the harness
+ * would then read the step's exit code as the workflow's own verdict (#1456).
+ * Off CI the harness skips, saying why; in CI a missing tool fails by name.
+ */
+const releaseShellReady =
+  spawnSync("bash", ["-c", "type mapfile && command -v jq && command -v sha256sum"], {
+    stdio: "ignore",
+  }).status === 0;
+const inCI = process.env.CI === "true";
 const bundlesWorkflowPath = path.resolve(root, ".github/workflows/ai-bundles.yml");
 const ciWorkflowPath = path.resolve(root, ".github/workflows/ci.yml");
 const releaseWorkflowPath = path.resolve(root, ".github/workflows/release.yml");
@@ -1045,11 +1058,18 @@ describe("OCR v3 bundle release workflow", () => {
     expect(dockerJob).not.toContain("repair-${VERSION}");
   });
 
-  it("revalidates exact release provenance before tag or checkpoint digest reuse", () => {
+  it("revalidates exact release provenance before tag or checkpoint digest reuse", (ctx) => {
     // Drives a bash harness (temp scripts, a fake docker CLI, .docker.log
     // fixtures) that the slimmed Docker Container E2E image can't reproduce;
     // validated in PR CI instead. `/.dockerenv` marks a container runtime.
-    if (existsSync("/.dockerenv")) return;
+    ctx.skip(existsSync("/.dockerenv"), "the Docker test image can't run this harness; PR CI does");
+    ctx.skip(
+      !releaseShellReady && !inCI,
+      "needs bash 4+, jq and sha256sum, as on GitHub's runners",
+    );
+    expect(releaseShellReady, "CI must provide bash 4+, jq and sha256sum for this harness").toBe(
+      true,
+    );
     const dockerJob = job(readRequired(releaseWorkflowPath), "docker", "scan");
     const stepName = "Reuse an existing published platform digest";
     const stepStart = dockerJob.indexOf(`      - name: ${stepName}\n`);
