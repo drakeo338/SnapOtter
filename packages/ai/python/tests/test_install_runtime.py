@@ -153,9 +153,8 @@ class InstallRuntimeTests(unittest.TestCase):
         self.fixture = RuntimeFixture(self.root)
         self.host = install_runtime.HostInfo(platform="linux", machine="x86_64")
         # Installs would otherwise probe the real host's cgroup memory, which
-        # makes the suite depend on the host: without a private cgroup
-        # namespace (GitHub runners, bare WSL2) the probe reaches the cgroup v2
-        # root and fails (#1636). The probe's own tests call the real function.
+        # makes the suite depend on the host's cgroup layout and limits. The
+        # probe's own tests call the real function.
         self._real_effective_memory_bytes = install_runtime._effective_memory_bytes
         memory_probe = mock.patch.object(
             install_runtime, "_effective_memory_bytes", return_value=64 * 1024**3
@@ -675,7 +674,7 @@ class InstallRuntimeTests(unittest.TestCase):
             Path, "read_text", new=read_text
         ):
             with self.assertRaisesRegex(install_runtime.PreflightError, "cgroup memory"):
-                install_runtime._effective_memory_bytes()
+                self._real_effective_memory_bytes()
 
     def test_effective_memory_fails_closed_for_unreadable_identified_controller(
         self,
