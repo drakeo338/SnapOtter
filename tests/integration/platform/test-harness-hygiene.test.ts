@@ -1,7 +1,10 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute } from "node:path";
 import pg from "pg";
 import { describe, expect, it } from "vitest";
+import { env } from "../../../apps/api/src/config.js";
 import {
   dropForkDatabase,
   dropOrphanedForkDatabases,
@@ -12,6 +15,7 @@ import {
   forkRoleName,
   forkRoleOwner,
 } from "../../setup/fork-db.js";
+import { forkDirOwner } from "../../setup/fork-dir.js";
 
 /**
  * #1277. The test Postgres used to keep its data in the anonymous volume the
@@ -250,5 +254,31 @@ describe("per-file login role cleanup (#1315)", () => {
       for (const name of [otherRunDb, db, liveDb]) await dropForkDatabase(baseUrl, name);
       for (const name of [role, liveRole]) await adminQuery(`DROP ROLE IF EXISTS ${name}`);
     }
+  });
+});
+
+/**
+ * #1471. Library files used to land in one folder for the whole run
+ * (FILES_STORAGE_PATH defaulted to ./data/files, relative to the repo), so a
+ * test counting or reading blobs raced every other file's uploads and
+ * deletes, and a local run left blobs in the checkout. Each file now stores
+ * them in its own fork directory, next to its workspace, which is removed
+ * when the file's process exits.
+ */
+describe("per-file library storage (#1471)", () => {
+  it("gives this file its own FILES_STORAGE_PATH, next to its workspace", () => {
+    const files = process.env.FILES_STORAGE_PATH as string;
+    const workspace = process.env.WORKSPACE_PATH as string;
+    expect(files, "tests/setup/per-fork-env.ts sets FILES_STORAGE_PATH").toBeTruthy();
+    expect(isAbsolute(files)).toBe(true);
+    expect(dirname(files)).toBe(dirname(workspace));
+    expect(dirname(files).startsWith(tmpdir())).toBe(true);
+    // The fork dir this worker owns, so its exit handler and the orphan sweep
+    // both remove the files with it.
+    expect(forkDirOwner(basename(dirname(files)))).toBe(process.pid);
+  });
+
+  it("is the path the app's config reads", () => {
+    expect(env.FILES_STORAGE_PATH).toBe(process.env.FILES_STORAGE_PATH);
   });
 });

@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 const ocrRuntime = vi.hoisted(() => ({
   getCapability: vi.fn(),
@@ -1777,10 +1777,17 @@ describe("Composite state - getFeatureStates", () => {
     expect(ocr?.error).toMatch(/4 GiB.*3 GiB.*Fast OCR remains available/i);
   });
 
-  it("keeps Fast available when the container memory controller cannot be inspected", () => {
+  it("keeps Fast available when the container memory controller cannot be inspected", async () => {
+    const unreadable = new Error(
+      "unable to read the process cgroup memory capacity from /sys/fs/cgroup/memory.max",
+      { cause: new Error("EACCES: permission denied") },
+    );
     ocrRuntime.getEffectiveMemory.mockImplementation(() => {
-      throw new Error("unable to read the process cgroup memory capacity");
+      throw unreadable;
     });
+    const { logger } = await import("../../../apps/api/src/lib/logger.js");
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    onTestFinished(() => warn.mockRestore());
 
     const ocr = mod.getFeatureStates().find((state) => state.id === "ocr");
 
@@ -1793,7 +1800,78 @@ describe("Composite state - getFeatureStates", () => {
       availableQualities: ["fast"],
     });
     expect(ocr?.error).toMatch(/cannot safely determine.*memory.*Fast OCR remains available/i);
+
+    // The UI message is fixed; the cause goes to the log, once, not per poll (#1501).
+    mod.getFeatureStates();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      { err: unreadable },
+      "[ocr-runtime] Accurate OCR can't be offered: this container's memory limit couldn't be read",
+    );
+
+    // A different cause logs right away, even with the same message.
+    ocrRuntime.getEffectiveMemory.mockImplementation(() => {
+      throw new Error(unreadable.message, { cause: new Error("EIO: i/o error") });
+    });
+    mod.getFeatureStates();
+    expect(warn).toHaveBeenCalledTimes(2);
+
+    // A read that works in between clears it, so the next failure logs again.
+    ocrRuntime.getEffectiveMemory.mockReturnValue(8 * 1024 ** 3);
+    mod.getFeatureStates();
+    ocrRuntime.getEffectiveMemory.mockImplementation(() => {
+      throw unreadable;
+    });
+    mod.getFeatureStates();
+    expect(warn).toHaveBeenCalledTimes(3);
   });
+
+  it.each([
+    [
+      "the runtime check already reported it",
+      {
+        available: false,
+        status: "incompatible",
+        reason: "memory-capacity-unknown",
+        qualities: [],
+        providers: [],
+      },
+    ],
+    [
+      "Accurate OCR is installed and working",
+      {
+        available: true,
+        status: "ready",
+        qualities: ["balanced", "best"],
+        providers: ["CPUExecutionProvider"],
+        descriptor: {
+          generation: "ocr-3.0.0-cpu",
+          artifact: {
+            version: "3.0.0",
+            // A target, so feature status does run its own memory read here.
+            target: process.arch === "arm64" ? "linux-arm64-cpu-py311" : "linux-amd64-cpu-py312",
+          },
+        },
+      },
+    ],
+  ])(
+    "leaves the memory failure to the runtime check when %s (#1501)",
+    async (_label, capability) => {
+      // Only a missing runtime makes the preflight decide what the UI shows, so
+      // only then is its read worth a line; otherwise it's a duplicate or noise.
+      ocrRuntime.getCapability.mockReturnValue(capability);
+      ocrRuntime.getEffectiveMemory.mockImplementation(() => {
+        throw new Error("unable to read the process cgroup memory capacity from /proc/self/cgroup");
+      });
+      const { logger } = await import("../../../apps/api/src/lib/logger.js");
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      onTestFinished(() => warn.mockRestore());
+
+      mod.getFeatureStates();
+
+      expect(warn).not.toHaveBeenCalled();
+    },
+  );
 
   it("lock held for bundle returns installing", () => {
     mod.acquireInstallLock("ocr");

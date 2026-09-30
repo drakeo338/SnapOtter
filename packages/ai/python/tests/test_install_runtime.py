@@ -152,6 +152,16 @@ class InstallRuntimeTests(unittest.TestCase):
         self.root = Path(self.temporary_directory.name)
         self.fixture = RuntimeFixture(self.root)
         self.host = install_runtime.HostInfo(platform="linux", machine="x86_64")
+        # Installs would otherwise probe the real host's cgroup memory, which
+        # makes the suite depend on the host: without a private cgroup
+        # namespace (GitHub runners, bare WSL2) the probe reaches the cgroup v2
+        # root and fails (#1636). The probe's own tests call the real function.
+        self._real_effective_memory_bytes = install_runtime._effective_memory_bytes
+        memory_probe = mock.patch.object(
+            install_runtime, "_effective_memory_bytes", return_value=64 * 1024**3
+        )
+        memory_probe.start()
+        self.addCleanup(memory_probe.stop)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -529,6 +539,28 @@ class InstallRuntimeTests(unittest.TestCase):
         generation_root = v3_root / "runtimes" / FAMILY / TARGET / "1.0.0-abc123"
         self.assertEqual(stat.S_IMODE(generation_root.stat().st_mode), 0o755)
 
+    def _assert_install_keeps_signed_modes_under_umask(self, umask: int) -> None:
+        # The installer must give every extracted file its signed mode itself.
+        # Under the default 022 an inherited mode happens to match, so only a
+        # tighter umask catches a regression here (#1563).
+        previous = os.umask(umask)
+        try:
+            result = self._install()
+        finally:
+            os.umask(previous)
+
+        for relative_path, (_contents, mode) in self.fixture.files.items():
+            with self.subTest(path=relative_path):
+                info = (result.generation_root / relative_path).lstat()
+                self.assertEqual(stat.S_IMODE(info.st_mode), mode)
+
+    def test_install_keeps_signed_modes_under_the_container_umask(self) -> None:
+        # docker/entrypoint.sh runs the app under umask 0007.
+        self._assert_install_keeps_signed_modes_under_umask(0o007)
+
+    def test_install_keeps_signed_modes_under_an_owner_only_umask(self) -> None:
+        self._assert_install_keeps_signed_modes_under_umask(0o077)
+
     def test_target_preflight_fails_before_creating_v3_state(self) -> None:
         artifact = self.fixture.artifact()
         artifact["target"] = "linux-arm64-cpu-py311"
@@ -600,7 +632,7 @@ class InstallRuntimeTests(unittest.TestCase):
         with mock.patch.object(os, "sysconf", side_effect=[8 * gib, 1]), mock.patch.object(
             Path, "read_text", new=read_from(private_files)
         ):
-            self.assertEqual(install_runtime._effective_memory_bytes(), 6 * gib)
+            self.assertEqual(self._real_effective_memory_bytes(), 6 * gib)
 
         host_files = {
             "/proc/self/cgroup": "0::/system.slice/docker-deadbeef.scope\n",
@@ -616,7 +648,7 @@ class InstallRuntimeTests(unittest.TestCase):
         with mock.patch.object(os, "sysconf", side_effect=[8 * gib, 1]), mock.patch.object(
             Path, "read_text", new=read_from(host_files)
         ):
-            self.assertEqual(install_runtime._effective_memory_bytes(), 5 * gib)
+            self.assertEqual(self._real_effective_memory_bytes(), 5 * gib)
 
     def test_effective_memory_fails_closed_when_a_non_root_limit_is_missing(
         self,
@@ -667,7 +699,7 @@ class InstallRuntimeTests(unittest.TestCase):
             Path, "read_text", new=read_text
         ):
             with self.assertRaisesRegex(install_runtime.PreflightError, "cgroup memory"):
-                install_runtime._effective_memory_bytes()
+                self._real_effective_memory_bytes()
 
     def test_effective_memory_fails_closed_when_mount_metadata_is_unreadable(
         self,
@@ -683,7 +715,7 @@ class InstallRuntimeTests(unittest.TestCase):
             Path, "read_text", new=read_text
         ):
             with self.assertRaisesRegex(install_runtime.PreflightError, "cgroup memory"):
-                install_runtime._effective_memory_bytes()
+                self._real_effective_memory_bytes()
 
     def test_effective_memory_fails_closed_when_linux_membership_is_unavailable(
         self,
@@ -703,7 +735,7 @@ class InstallRuntimeTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     install_runtime.PreflightError, "cgroup memory"
                 ):
-                    install_runtime._effective_memory_bytes()
+                    self._real_effective_memory_bytes()
 
     def test_model_digests_must_bind_to_files_in_the_exact_manifest(self) -> None:
         artifact = self.fixture.artifact()

@@ -143,9 +143,39 @@ export function trackFeedbackPromptDismissed(
   });
 }
 
-export function classifyFeedbackError(message: string | null | undefined): FeedbackErrorCategory {
+/**
+ * An error whose feedback category is known where it was raised. The message
+ * the user sees is translated, so the category has to travel with it rather
+ * than be read back out of the text (#1596).
+ */
+export class FeedbackCategoryError extends Error {
+  readonly category: FeedbackErrorCategory;
+
+  constructor(message: string, category: FeedbackErrorCategory) {
+    super(message);
+    this.name = "FeedbackCategoryError";
+    this.category = category;
+  }
+}
+
+/** The category a caught error carries, or null when it doesn't carry one. */
+export function feedbackCategoryOf(err: unknown): FeedbackErrorCategory | null {
+  return err instanceof FeedbackCategoryError ? err.category : null;
+}
+
+/**
+ * The feedback category for a failure. A category stored with the failure wins.
+ * Otherwise the message is matched for English keywords, which only works for
+ * server text: a translated message falls through to processing_error.
+ */
+export function classifyFeedbackError(
+  message: string | null | undefined,
+  category?: FeedbackErrorCategory | null,
+): FeedbackErrorCategory {
   const value = (message ?? "").toLowerCase();
+  // A category means nothing without the failure it describes.
   if (!value) return "unknown";
+  if (category) return category;
   if (value.includes("timed out") || value.includes("timeout")) return "timeout";
   if (value.includes("upload") || value.includes("interrupted")) return "upload_error";
   if (value.includes("validation") || value.includes("invalid") || value.includes("required")) {
