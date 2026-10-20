@@ -29,6 +29,7 @@ import { isImageFile } from "@/components/common/dropzone";
 import { useTranslation } from "@/contexts/i18n-context";
 import { type CollageTemplate, getTemplateById } from "@/lib/collage-templates";
 import { format } from "@/lib/format";
+import { showUnsupportedFileType } from "@/lib/intake-notice";
 import { cn } from "@/lib/utils";
 import type { CellTransform, CollageImage } from "@/stores/collage-store";
 import { useCollageStore } from "@/stores/collage-store";
@@ -102,10 +103,12 @@ function UploadArea() {
       e.preventDefault();
       e.stopPropagation();
       setIsDragging(false);
-      const files = Array.from(e.dataTransfer.files).filter(isImageFile);
+      const dropped = Array.from(e.dataTransfer.files);
+      const files = dropped.filter(isImageFile);
       if (files.length > 0) addImages(files);
+      else if (dropped.length > 0) showUnsupportedFileType(t.dropzone.unsupportedFileType);
     },
-    [addImages],
+    [addImages, t],
   );
 
   const handleClick = () => {
@@ -114,8 +117,11 @@ function UploadArea() {
     input.multiple = true;
     input.accept = "image/*,.avif,.heic,.heif,.hif";
     input.onchange = (e) => {
-      const files = Array.from((e.target as HTMLInputElement).files || []);
+      const selected = Array.from((e.target as HTMLInputElement).files || []);
+      if (selected.length === 0) return;
+      const files = selected.filter(isImageFile);
       if (files.length > 0) addImages(files);
+      else showUnsupportedFileType(t.dropzone.unsupportedFileType);
     };
     input.click();
   };
@@ -630,6 +636,7 @@ function CollageCell({
 
 /** Thumbnail strip at the bottom for managing images. */
 function ImageStrip() {
+  const { t } = useTranslation();
   const store = useCollageStore();
   const { images } = store;
 
@@ -639,11 +646,14 @@ function ImageStrip() {
     input.multiple = true;
     input.accept = "image/*,.avif,.heic,.heif,.hif";
     input.onchange = (e) => {
-      const files = Array.from((e.target as HTMLInputElement).files || []);
+      const selected = Array.from((e.target as HTMLInputElement).files || []);
+      if (selected.length === 0) return;
+      const files = selected.filter(isImageFile);
       if (files.length > 0) store.addImages(files);
+      else showUnsupportedFileType(t.dropzone.unsupportedFileType);
     };
     input.click();
-  }, [store]);
+  }, [store, t]);
 
   return (
     <div className="shrink-0 border-t border-border bg-background px-3 py-2">
