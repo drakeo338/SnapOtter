@@ -25,7 +25,7 @@ import {
   X,
 } from "lucide-react";
 import { type DragEvent, useCallback, useEffect, useRef, useState } from "react";
-import { isImageFile } from "@/components/common/dropzone";
+import { expandAccept, isImageFile } from "@/components/common/dropzone";
 import { useTranslation } from "@/contexts/i18n-context";
 import { type CollageTemplate, getTemplateById } from "@/lib/collage-templates";
 import { format } from "@/lib/format";
@@ -115,7 +115,7 @@ function UploadArea() {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
-    input.accept = "image/*,.avif,.heic,.heif,.hif";
+    input.accept = expandAccept("image/*") ?? "image/*";
     input.onchange = (e) => {
       const selected = Array.from((e.target as HTMLInputElement).files || []);
       if (selected.length === 0) return;
@@ -644,7 +644,7 @@ function ImageStrip() {
     const input = document.createElement("input");
     input.type = "file";
     input.multiple = true;
-    input.accept = "image/*,.avif,.heic,.heif,.hif";
+    input.accept = expandAccept("image/*") ?? "image/*";
     input.onchange = (e) => {
       const selected = Array.from((e.target as HTMLInputElement).files || []);
       if (selected.length === 0) return;

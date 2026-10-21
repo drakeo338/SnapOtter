@@ -103,9 +103,9 @@ interface DropzoneProps {
 
 // Browsers may not map certain formats (HEIC, JXL, RAW, etc.) to image/* in file pickers.
 // Append explicit extensions so they are selectable.
-function expandAccept(accept?: string): string | undefined {
+export function expandAccept(accept?: string): string | undefined {
   if (!accept?.includes("image/*")) return accept;
-  return `${accept},.avif,.heic,.heif,.hif,.jxl,.ico,.dng,.cr2,.cr3,.nef,.nrw,.arw,.orf,.rw2,.raf,.pef,.3fr,.iiq,.srw,.x3f,.rwl,.gpr,.fff,.mrw,.mef,.kdc,.dcr,.erf,.ptx,.tga,.psd,.exr,.hdr,.svgz,.jp2,.j2k,.j2c,.jpc,.jpf,.jpx,.qoi,.eps,.epsf,.dds,.cur,.apng,.dpx,.cin,.fits,.fit,.fts,.ppm,.pgm,.pbm,.pnm,.pam,.pfm`;
+  return `${accept},.avif,.heic,.heif,.hif,.jxl,.tiff,.tif,.ico,.dng,.cr2,.cr3,.nef,.nrw,.arw,.orf,.rw2,.raf,.pef,.3fr,.iiq,.srw,.x3f,.rwl,.gpr,.fff,.mrw,.mef,.kdc,.dcr,.erf,.ptx,.tga,.psd,.exr,.hdr,.svgz,.jp2,.j2k,.j2c,.jpc,.jpf,.jpx,.qoi,.eps,.epsf,.dds,.cur,.apng,.dpx,.cin,.fits,.fit,.fts,.ppm,.pgm,.pbm,.pnm,.pam,.pfm`;
 }
 
 export function Dropzone({
